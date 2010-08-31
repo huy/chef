@@ -27,6 +27,7 @@ require 'uri'
 require 'tempfile'
 require 'net/https'
 require 'set'
+require 'pathname'
 
 class Chef
   class Provider
@@ -112,11 +113,20 @@ class Chef
       end
       
       def ensure_directory_exists(path)
-        unless ::File.directory?(path)
-          directory_to_create = resource_for_directory(path)
-          directory_to_create.run_action(:create)
-          @new_resource.updated = true if directory_to_create.updated?
-        end
+        dirs_to_create = []
+        @created_dirs ||= []
+        unless @created_dirs.include?(path)
+          Pathname.new(path).ascend do |dir|
+            break if dir.to_s==@new_resource.path
+            dirs_to_create << dir.to_s unless @created_dirs.include?(dir.to_s)    
+          end
+          dirs_to_create.reverse.each do |dir|
+            res = resource_for_directory(dir)
+            res.run_action(:create)
+            @new_resource.updated = true if res.updated?
+            @created_dirs << dir
+          end
+        end    
       end
 
       def resource_for_directory(path)
@@ -125,7 +135,6 @@ class Chef
         dir.mode(@new_resource.mode)
         dir.group(@new_resource.group)
         dir.owner(@new_resource.owner)
-        dir.recursive(true)
         dir
       end
 
