@@ -60,136 +60,167 @@ class Chef::Provider::Route < Chef::Provider
             '255.255.255.254'  => '31',
             '255.255.255.255'  => '32' }
 
-    def load_current_resource
-      is_running = nil
+  def load_current_resource
+    @route_exists = nil
 
-      Chef::Log.debug("Configuring Route #{@new_resource.name}")
+    Chef::Log.info("in load_current_resource  name=#{@new_resource.name}, gateway=#{@new_resource.gateway}")
 
-      # cidr or quad dot mask
-      if @new_resource.netmask
-        new_ip = IPAddr.new("#{@new_resource.target}/#{@new_resource.netmask}")
-      else
-        new_ip = IPAddr.new(@new_resource.target)
-      end
+    case node[:os] 
+    when "linux"
+      @route_exists=true if find_running_route_linux(:name=>@new_resource.name,
+                              :netmask=>@new_resource.netmask,
+                              :gateway=>@new_resource.gateway,
+                              :device=>@new_resource.device)
+    end
+  end
 
-      # pull routes from proc
-      if node[:os] == "linux"
-        route_file = ::File.open("/proc/net/route", "r")
-        while (line = route_file.gets)
-          # proc layout
-          iface,destination,gateway,flags,refcnt,use,metric,mask,mtu,window,irtt = line.split
+  def find_running_route_linux(route_spec)
+    route_file = ::File.open("/proc/net/route", "r")
+    while (line = route_file.gets)
+      # proc layout
+      iface,destination,gateway,flags,refcnt,use,metric,mask,mtu,window,irtt = line.split
+      next if irtt == "IRTT"
 
-          # need to convert packed adresses int quad dot
-          #  the addrs are reversed hex packed decimal addrs. so this unwraps them. tho you could
-          #  do this without ipaddr using unpack. ipaddr has no htoa method.
-          #
-          destination = IPAddr.new(destination.scan(/../).reverse.to_s.hex, Socket::AF_INET).to_s
-          gateway = IPAddr.new(gateway.scan(/../).reverse.to_s.hex, Socket::AF_INET).to_s
-          mask = IPAddr.new(mask.scan(/../).reverse.to_s.hex, Socket::AF_INET).to_s
-          Chef::Log.debug( "System has route:  dest=#{destination} mask=#{mask} gw=#{gateway}")
+      #Chef::Log.info("destination=#{destination},mask=#{mask}")
+      running_route = {:name=> htoa(destination),
+                       :netmask=> htoa(mask),
+                       :gateway=> htoa(gateway),
+                       :device=> iface}
 
-          # check if what were trying to configure is already there
-          # use an ipaddr object with ip/mask this way we can have
-          # a new resource be in cidr format (i don't feel like
-          # expanding bitmask by hand.
-          #
-          running_ip = IPAddr.new("#{destination}/#{mask}")
-          Chef::Log.debug( "new ip: #{new_ip.inspect} running ip: #{running_ip.inspect} ")
-          is_running = true if running_ip == new_ip
-        end
-      route_file.close
+      return running_route if compare_route(route_spec,running_route)
+    end
+    route_file.close
+    return nil
+  end
+
+  # cidr or quad dot mask
+  def get_ip(addr, mask)
+    # should bitch here if there is a / in addr and  mask is also set.
+    if (addr =~ /\// &&  mask)
+      raise Chef::Exceptions::Route, "Cannot modify #{@new_resource} Adress is in CIDR format and  mask was also provided"
+    end
+    return IPAddr.new("#{addr}/#{mask}") if mask
+    return IPAddr.new(addr)
+  end
+
+  def compare_route(route1,route2)
+    route1_ip = get_ip(route1[:name], route1[:netmask])
+    route2_ip = get_ip(route2[:name], route2[:netmask])
+    if (route1_ip == route2_ip && route1[:gateway] == route2[:gateway]) 
+      if (route1[:device] == route2[:device]) or (route1[:device].to_s.empty?) or (route2[:device].to_s.empty?) 
+         return true
       end
     end
+    return false
+  end
 
-    def action_add
-      # check to see if load_current_resource found the route
-      if  is_running
-        Chef::Log.debug("Route #{@new_resource.name} already active ")
-      else
-        command = generate_command(:add)
-
-        Chef::Log.info("Adding route: #{command} ")
-        run_command( :command => command )
-        @new_resource.updated = true
-      end
-
-      #for now we always write the file (ugly but its what it is)
+  def action_add
+    unless @route_exists
+      command = generate_command(:add)
+      Chef::Log.info("Adding route: #{command}")
+      run_command( :command => command )
+      @new_resource.updated = true
       generate_config
+    else
+      Chef::Log.info("Route #{command} already exists")
+    end
+  end
+
+  def action_delete
+    if @route_exists
+      command = generate_command(:delete)
+      Chef::Log.info("Removing route: #{command}")
+      run_command( :command => command )
+      @new_resource.updated = true
+      generate_config
+    else
+      Chef::Log.debug("Route #{@new_resource.name} does not exist")
+    end
+  end
+
+  def generate_config
+    conf = Hash.new
+    # walk the collection load up conf hash with all the routes we
+    # should write
+    position = 0
+    run_context.resource_collection.each do |resource|  
+      if resource.is_a? Chef::Resource::Route
+        dev = resource.device ? resource.device : default_dev(:name => resource.name, 
+                                                              :netmask => resource.netmask, 
+                                                              :gateway => resource.gateway)
+        conf[dev] ||= ''
+        if resource.action == :add
+          conf[dev] << config_file_contents(:add, :position=>position, 
+            :target => resource.name, :netmask => resource.netmask, :gateway => resource.gateway)
+          position = position + 1
+        end
+      end
     end
 
-    def action_delete
-      if is_running
-        command = generate_command(:delete)
+    # add new platform configs here
+    case node[:platform]
+    when "centos", "redhat", "fedora", "xenserver"
+      generate_redhat(conf)
+    else 
+      Chef::Log.warn("#{node[:platform]} not supported by Route provider (yet) can't generate a config file")
+    end
+  end
 
-        Chef::Log.info("Removing route: #{command}")
-        run_command( :command => command )
-        @new_resource.updated = true
+  def generate_redhat(conf)
+    conf.each do |k, v|
+      network_file = ::File.new("/etc/sysconfig/network-scripts/route-#{k}", "w")
+      network_file.puts(conf[k])
+      Chef::Log.debug("writing route.#{k}\n#{conf[k]}")
+      network_file.close
+    end
+  end
+
+  def generate_command(action)
+    #todo: should set this up per-sys type
+    common_route_items = ''
+    common_route_items << "/#{MASK[@new_resource.netmask.to_s]}" if @new_resource.netmask
+    common_route_items << " via #{@new_resource.gateway}" if @new_resource.gateway
+
+    case action
+    when :add
+      command = "ip route replace #{@new_resource.name}"
+      command << common_route_items
+      command << " dev #{@new_resource.device}" if @new_resource.device
+    when :delete
+      command = "ip route delete #{@new_resource.name}"
+      command << common_route_items
+    end
+
+    return command
+  end
+
+  def config_file_contents(action, options={})
+    content = ''
+    case action
+    when :add
+      content << "ADDRESS#{options[:position]}=#{options[:target]}\n"
+      content << "NETMASK#{options[:position]}=#{options[:netmask]}\n"
+      content << "GATEWAY#{options[:position]}=#{options[:gateway]}\n" 
+    end
+
+    return content
+  end
+ 
+  def default_dev(route_spec)
+    case node[:os]
+    when "linux"
+      running_route = find_running_route_linux(route_spec) 
+      if running_route
+        return running_route[:device]
       else
-        Chef::Log.debug("Route #{@new_resource.name} does not exist")
+        return "eth0"
       end
+    when "darwin"
+      return "en0"
     end
+  end
 
-    def generate_config
-      conf = Hash.new
-      case node[:platform]
-      when ("centos" || "redhat" || "fedora")
-        # walk the collection
-        run_context.resource_collection.each do |resource|
-          if resource.is_a? Chef::Resource::Route
-            # default to eth0
-            if resource.device
-              dev = resource.device
-            else
-              dev = "eth0"
-            end
-
-            conf[dev] = String.new if conf[dev].nil?
-            if resource.action == :add
-              conf[dev] = config_file_contents(:add, :target => resource.target, :netmask => resource.netmask, :gateway => resource.gateway)
-            else
-              # need to do this for the case when the last route on an int
-              # is removed
-              conf[dev] = config_file_contents(:delete)
-            end
-          end
-        end
-        conf.each do |k, v|
-          network_file = ::File.new("/etc/sysconfig/network-scripts/route-#{k}", "w")
-          network_file.puts(conf[k])
-          Chef::Log.debug("writing route.#{k}\n#{conf[k]}")
-          network_file.close
-        end
-      end
-    end
-
-    def generate_command(action)
-      common_route_items = ''
-      common_route_items << "/#{MASK[@new_resource.netmask.to_s]}" if @new_resource.netmask
-      common_route_items << " via #{@new_resource.gateway} " if @new_resource.gateway
-
-      case action
-      when :add
-        command = "ip route replace #{@new_resource.target}"
-        command << common_route_items
-        command << " dev #{@new_resource.device} " if @new_resource.device
-      when :delete
-        command = "ip route delete #{@new_resource.target}"
-        command << common_route_items
-      end
-
-      return command
-    end
-
-    def config_file_contents(action, options={})
-      content = ''
-      case action
-      when :add
-        content << "#{options[:target]}"
-        content << "/#{options[:netmask]}" if options[:netmask]
-        content << " via #{options[:gateway]}" if options[:gateway]
-        content << "\n"
-      end
-
-      return content
-    end
+  def htoa(packed)
+    IPAddr.new(packed.scan(/../).reverse.to_s.hex, Socket::AF_INET).to_s
+  end
 end
